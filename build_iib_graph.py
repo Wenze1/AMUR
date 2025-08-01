@@ -31,8 +31,8 @@ def gen_item_matrix(all_edge, no_items):
             item_head = edge_dict[head_key]
             item_rear = edge_dict[rear_key]
             # print(len(item_head.intersection(item_rear)))
-            inter_len = len(item_head.intersection(item_rear)) # 两个物品对应用户集的交集的大小
-            if inter_len >= 2: # 去掉这个 iib就只剩自环了
+            inter_len = len(item_head.intersection(item_rear)) 
+            if inter_len >= 2: 
                 item_graph_matrix[head_key-min_item][rear_key-min_item] = inter_len
                 item_graph_matrix[rear_key-min_item][head_key-min_item] = inter_len
     bar.close()
@@ -85,7 +85,7 @@ if __name__ == 	'__main__':
 
     item_num = torch.zeros(num_item)
     for i in range(num_item):
-        item_num[i] = len(torch.nonzero(item_graph_matrix[i])) # item_graph_matrix(iib图)上每一行非零元素一共多少
+        item_num[i] = len(torch.nonzero(item_graph_matrix[i])) 
         # print("this is ", i, "num", item_num[i])
     edge_list_i = []
     edge_list_j = []
@@ -99,7 +99,7 @@ if __name__ == 	'__main__':
             edge_list = [edge_list_i, edge_list_j]
             item_graph_dict[i] = edge_list
         else:
-            item_i = torch.topk(item_graph_matrix[i], top_k) # 找iib图中的topk
+            item_i = torch.topk(item_graph_matrix[i], top_k) 
             edge_list_i = item_i.indices.numpy().tolist()
             edge_list_j = item_i.values.numpy().tolist()
             edge_list = [edge_list_i, edge_list_j]
