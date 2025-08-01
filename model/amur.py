@@ -257,11 +257,11 @@ class AMUR(GeneralRecommender):
         if build_item_graph:
             updated_image_g, att_i = self.graphlearner_image(image_item_embeds, temperature=1) # torch sp tensor
             updated_text_g, att_t = self.graphlearner_text(text_item_embeds, temperature=1)
-            image_graph = self.sym_normalize(updated_image_g) 
-            # image_graph = self.session_adj
+            # image_graph = self.sym_normalize(updated_image_g) 
+            image_graph = self.session_adj
             self.image_graph = self.res_conn*self.image_original_adj + (1-self.res_conn)*image_graph
-            text_graph = self.sym_normalize(updated_text_g)
-            # text_graph = self.session_adj
+            # text_graph = self.sym_normalize(updated_text_g)
+            text_graph = self.session_adj
             self.text_graph = self.res_conn*self.text_original_adj + (1-self.res_conn)*text_graph
           
         else:
