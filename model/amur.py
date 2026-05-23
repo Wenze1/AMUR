@@ -17,17 +17,13 @@ class GraphLearner(nn.Module):
         self.drop = config['drop']
         self.adj_matrix = network.coalesce()
         self.device = device
-        self.cos = nn.CosineSimilarity(dim=1, eps=1e-6)
-        # self.MLP = nn.Sequential(nn.Linear(2*self.hidden, 1), nn.Tanh(), nn.Dropout(self.drop))
-        # self.MLP = nn.Sequential(
-        #         nn.Linear(self.hidden*2, 1)
-        # )
-        # self.MLP = nn.Sequential(
-        #         nn.Linear(self.hidden*2, self.hidden),
-        #         nn.GELU(),
-        #         nn.Linear(self.hidden, 1)
-        # )
-        
+        self.edge_scores = self.adj_matrix.values().float().to(self.device).unsqueeze(-1)
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(2 * self.hidden + 1, self.hidden),
+            nn.GELU(),
+            nn.Dropout(self.drop),
+            nn.Linear(self.hidden, 1)
+        )        
     def sample_gumbel(self, shape):
         """ sample from Gumbel(0,1) """
         U = torch.rand(shape)
@@ -35,29 +31,18 @@ class GraphLearner(nn.Module):
     
         
     def gumbel_softmax_sample(self, logits, temperature):
-        # r = self.sample_gumbel(logits.size())
-        if self.training:
-            values = logits # +r # https://pytorch.org/docs/stable/sparse.html 
-        else:
-            values = logits
-        values = (values/temperature).sigmoid()
-        # values_hard = torch.where(values<0.5, 0, 1) # with gumbel
-        values_hard = torch.where(values<=0.5, 0, values) # with gumbel new 
-        # non_zero = int(torch.count_nonzero(values_hard))
-        # print(non_zero/torch.numel(values_hard)) 
-        values = (values_hard - values).detach() + values 
-        y= torch.sparse.FloatTensor(self.adj_matrix.indices(), values, self.adj_matrix.shape) 
+        values = (logits / temperature).sigmoid()
+        values_hard = torch.where(values <= 0.5, 0, values)
+        values = (values_hard - values).detach() + values
+        y = torch.sparse.FloatTensor(self.adj_matrix.indices(), values, self.adj_matrix.shape).to(self.device)
         return y, values
         
     def forward(self, node_embs, temperature):
         f1 = node_embs[self.adj_matrix.indices()[0]]
-        f2 = node_embs[self.adj_matrix.indices()[1]] # [data_size,d]
-        
-        # temp = torch.cat([f1, f2], dim=-1) # [data_size, 2d]
-        # temp = self.MLP(temp)
-        # att_log = temp.squeeze(1) # [data_size] att_log
-        att_log = self.cos(f1,f2)
-        graph, att = self.gumbel_softmax_sample(att_log, temperature) # att
+        f2 = node_embs[self.adj_matrix.indices()[1]]
+        edge_input = torch.cat([f1, f2, self.edge_scores], dim=-1)
+        att_log = self.edge_mlp(edge_input).squeeze(-1)
+        graph, att = self.gumbel_softmax_sample(att_log, temperature)
         return graph.coalesce(), att
 
 class AMUR(GeneralRecommender):
@@ -68,6 +53,9 @@ class AMUR(GeneralRecommender):
         self.ip_loss = config['cl_ip_loss']
         self.kl_loss = config['kl_loss']
         self.kl_loss2 = config['kl_loss']
+        self.shared_cl_loss = self._config_get(config, 'shared_cl_loss', self.cl_loss)
+        self.shared_ip_loss = self._config_get(config, 'shared_ip_loss', self.ip_loss)
+        self.eps = self._config_get(config, 'eps', 1e-8)
         self.n_ui_layers = config['n_ui_layers']
         self.embedding_dim = config['embedding_size']
         self.knn_k = config['knn_k']
@@ -138,7 +126,31 @@ class AMUR(GeneralRecommender):
         
         self.graphlearner_image = GraphLearner(config, self.image_original_adj, device=self.device)
         self.graphlearner_text = GraphLearner(config, self.text_original_adj, device=self.device)
+        self.image_behavior_ref = self.get_behavior_edge_targets(self.image_original_adj)
+        self.text_behavior_ref = self.get_behavior_edge_targets(self.text_original_adj)
+        self.image_edge_rows = self.image_original_adj.coalesce().indices()[0].to(self.device)
+        self.text_edge_rows = self.text_original_adj.coalesce().indices()[0].to(self.device)
+        self.shared_gate_image = nn.Sequential(
+            nn.Linear(3 * self.embedding_dim, self.embedding_dim),
+            nn.GELU(),
+            nn.Dropout(config['drop']),
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.Sigmoid()
+        )
+        self.shared_gate_text = nn.Sequential(
+            nn.Linear(3 * self.embedding_dim, self.embedding_dim),
+            nn.GELU(),
+            nn.Dropout(config['drop']),
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.Sigmoid()
+        )
         
+
+    def _config_get(self, config, key, default):
+        try:
+            return config[key]
+        except (KeyError, TypeError):
+            return default
 
     def pre_epoch_processing(self):
         self.build_item_graph = True
@@ -176,6 +188,35 @@ class AMUR(GeneralRecommender):
         shape = torch.Size(sparse_mx.shape)
         return torch.sparse.FloatTensor(indices, values, shape)
 
+    def get_behavior_edge_targets(self, candidate_adj):
+        candidate_adj = candidate_adj.coalesce()
+        candidate_indices = candidate_adj.indices().detach().cpu()
+        session_adj = self.session_adj.coalesce().detach().cpu()
+        session_indices = session_adj.indices()
+        session_values = session_adj.values()
+        behavior_map = {
+            (int(session_indices[0, idx]), int(session_indices[1, idx])): float(session_values[idx])
+            for idx in range(session_values.numel())
+        }
+        raw_targets = [
+            behavior_map.get((int(candidate_indices[0, idx]), int(candidate_indices[1, idx])), 0.0)
+            for idx in range(candidate_indices.size(1))
+        ]
+        targets = torch.tensor(raw_targets, dtype=torch.float32, device=self.device)
+        rows = candidate_adj.indices()[0].to(self.device)
+        row_sum = torch.zeros(self.n_items, device=self.device).scatter_add_(0, rows, targets)
+        row_count = torch.zeros(self.n_items, device=self.device).scatter_add_(0, rows, torch.ones_like(targets))
+        uniform_targets = 1.0 / row_count[rows].clamp_min(1.0)
+        normalized_targets = targets / (row_sum[rows] + self.eps)
+        targets = torch.where(row_sum[rows] > 0, normalized_targets, uniform_targets)
+        return targets.clamp_min(self.eps).detach()
+
+    def behavior_edge_kl(self, edge_probs, edge_targets, edge_rows):
+        edge_probs = edge_probs.clamp_min(self.eps)
+        row_sum = torch.zeros(self.n_items, device=self.device).scatter_add_(0, edge_rows, edge_probs)
+        prob_dist = edge_probs / (row_sum[edge_rows] + self.eps)
+        target_dist = edge_targets.clamp_min(self.eps)
+        return (prob_dist * torch.log((prob_dist + self.eps) / target_dist)).mean()
     def get_r(self, decay_interval=10, decay_r=0.1, current_epoch=0, init_r=0.9, final_r=0.5): # 10 0.1 
         r = init_r - current_epoch // decay_interval * decay_r 
         if r < final_r:
@@ -257,12 +298,10 @@ class AMUR(GeneralRecommender):
         if build_item_graph:
             updated_image_g, att_i = self.graphlearner_image(image_item_embeds, temperature=1) # torch sp tensor
             updated_text_g, att_t = self.graphlearner_text(text_item_embeds, temperature=1)
-            # image_graph = self.sym_normalize(updated_image_g) 
-            image_graph = self.session_adj
-            self.image_graph = self.res_conn*self.image_original_adj + (1-self.res_conn)*image_graph
-            # text_graph = self.sym_normalize(updated_text_g)
-            text_graph = self.session_adj
-            self.text_graph = self.res_conn*self.text_original_adj + (1-self.res_conn)*text_graph
+            image_graph = updated_image_g
+            self.image_graph = (self.res_conn * self.image_original_adj + (1 - self.res_conn) * image_graph).coalesce()
+            text_graph = updated_text_g
+            self.text_graph = (self.res_conn * self.text_original_adj + (1 - self.res_conn) * text_graph).coalesce()
           
         else:
             self.image_graph = self.image_graph.detach()
@@ -285,14 +324,21 @@ class AMUR(GeneralRecommender):
         text_user_embeds = torch.sparse.mm(self.R, text_item_embeds)
         text_embeds = torch.cat([text_user_embeds, text_item_embeds], dim=0)
         
-        side_embeds = (0.1*image_embeds + 0.9*text_embeds)/3 
-        
+        side_embeds = (0.1*image_embeds + 0.9*text_embeds)/3
+        content_embeds_user, content_embeds_items = torch.split(content_embeds, [self.n_users, self.n_items], dim=0)
+        image_gate = self.shared_gate_image(torch.cat([image_item_embeds, text_item_embeds, content_embeds_items], dim=-1))
+        text_gate = self.shared_gate_text(torch.cat([text_item_embeds, image_item_embeds, content_embeds_items], dim=-1))
+        shared_image_item_embeds = image_gate * image_item_embeds
+        shared_text_item_embeds = text_gate * text_item_embeds
+
         all_embeds = content_embeds + side_embeds # content->id side->MM
 
         all_embeddings_users, all_embeddings_items = torch.split(all_embeds, [self.n_users, self.n_items], dim=0)
 
         if train:
-            return all_embeddings_users, all_embeddings_items, side_embeds, content_embeds, updated_image_g, updated_text_g
+            return (all_embeddings_users, all_embeddings_items, side_embeds, content_embeds,
+                    image_item_embeds, text_item_embeds, shared_image_item_embeds,
+                    shared_text_item_embeds, att_i, att_t)
 
         return all_embeddings_users, all_embeddings_items
 
@@ -328,33 +374,31 @@ class AMUR(GeneralRecommender):
         pos_items = interaction[1]
         neg_items = interaction[2]
 
-        ua_embeddings, ia_embeddings, side_embeds, content_embeds, att_i, att_t = self.forward(
+        (ua_embeddings, ia_embeddings, side_embeds, content_embeds, image_item_embeds,
+         text_item_embeds, shared_image_item_embeds, shared_text_item_embeds,
+         att_i, att_t) = self.forward(
             self.norm_adj, train=True, build_item_graph=self.build_item_graph)
         
         u_g_embeddings = ua_embeddings[users]
         pos_i_g_embeddings = ia_embeddings[pos_items]
         neg_i_g_embeddings = ia_embeddings[neg_items]
 
-        # r = self.get_r(current_epoch=epoch)
-        kl_loss = self.kl_func(self.softmax(att_i.to_dense()[pos_items]).log(), self.softmax(self.session_adj.to_dense()[pos_items]))
-        kl_loss2 =  self.kl_func(self.softmax(att_t.to_dense()[pos_items]).log(), self.softmax(self.session_adj.to_dense()[pos_items]))
+        kl_loss = self.behavior_edge_kl(att_i, self.image_behavior_ref, self.image_edge_rows)
+        kl_loss2 = self.behavior_edge_kl(att_t, self.text_behavior_ref, self.text_edge_rows)
 
         batch_mf_loss, batch_emb_loss, batch_reg_loss = self.bpr_loss(u_g_embeddings, pos_i_g_embeddings,
                                                                       neg_i_g_embeddings)
         
         side_embeds_users, side_embeds_items = torch.split(side_embeds, [self.n_users, self.n_items], dim=0)
         content_embeds_user, content_embeds_items = torch.split(content_embeds, [self.n_users, self.n_items], dim=0)
-        if self.dataset == 'clothing':
-            cl_loss = self.InfoNCE(side_embeds_items[pos_items], content_embeds_items[pos_items], 0.2) + self.InfoNCE(
-                side_embeds_users[users], content_embeds_user[users], 0.2)
-            ip_loss = self.mse(side_embeds_items[pos_items], content_embeds_items[pos_items]) + self.mse(
-                side_embeds_users[users], content_embeds_user[users])
-        else:
-            cl_loss = self.InfoNCE(side_embeds_users[users], content_embeds_user[users], 0.2)
-            ip_loss = self.mse(side_embeds_users[users], content_embeds_user[users])
+        cl_loss = 0.5 * (
+            self.InfoNCE(shared_image_item_embeds[pos_items], shared_text_item_embeds[pos_items], 0.2) +
+            self.InfoNCE(shared_text_item_embeds[pos_items], shared_image_item_embeds[pos_items], 0.2)
+        )
+        ip_loss = self.mse(shared_image_item_embeds[pos_items], shared_text_item_embeds[pos_items])
             
         uicl_loss = self.InfoNCE(side_embeds_items[pos_items], u_g_embeddings, 0.2)
-        aux_loss = self.cl_loss * cl_loss + self.ip_loss* ip_loss + self.uicl_loss * uicl_loss + self.kl_loss*kl_loss + self.kl_loss2*kl_loss2
+        aux_loss = self.shared_cl_loss * cl_loss + self.shared_ip_loss * ip_loss + self.uicl_loss * uicl_loss + self.kl_loss * kl_loss + self.kl_loss2 * kl_loss2
 
         return batch_mf_loss + batch_emb_loss + batch_reg_loss + aux_loss
 
